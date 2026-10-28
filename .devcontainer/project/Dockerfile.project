@@ -1,0 +1,27 @@
+# Project-specific Dockerfile steps (appended before CMD in the base Dockerfile)
+#
+# These RUN steps are cached by Docker's layer cache, making rebuilds faster
+# for large SDK installations. The base Dockerfile switches to USER devuser
+# before this point, so commands here run as devuser by default.
+#
+# ARGs from the base Dockerfile (USERNAME, PYTHON_VERSION, etc.) are in scope.
+# COPY paths are relative to the build context (workspace root).
+#
+# Examples:
+#
+# Install Flutter SDK at build time:
+# RUN git clone https://github.com/flutter/flutter.git -b stable ~/.flutter-sdk \
+#     && ~/.flutter-sdk/bin/flutter precache --web
+# ENV PATH="/home/devuser/.flutter-sdk/bin:${PATH}"
+#
+# Install a Go binary:
+# USER root
+# RUN curl -fsSL https://go.dev/dl/go1.22.0.linux-amd64.tar.gz | tar -C /usr/local -xz
+# ENV PATH="/usr/local/go/bin:${PATH}"
+# USER devuser
+#
+# Install custom apt packages (with Docker layer caching):
+# USER root
+# RUN apt-get update && apt-get install -y --no-install-recommends cowsay \
+#     && rm -rf /var/lib/apt/lists/*
+# USER devuser

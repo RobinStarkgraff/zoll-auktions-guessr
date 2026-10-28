@@ -1,0 +1,1130 @@
+#!/bin/bash
+# innoclaude — InnoClaude DevContainer Base bootstrap wrapper
+# Similar to gradlew: ensures the base layer is present and matches the pinned version.
+# This is the only base-related file committed to consuming projects.
+# Dependencies: bash, git, python3 (on host). All pre-installed on macOS and Linux.
+
+set -euo pipefail
+
+WRAPPER_VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$SCRIPT_DIR/base"
+VERSION_FILE="$SCRIPT_DIR/.devcontainer-version"
+CONFIG_FILE="$SCRIPT_DIR/.devcontainer-config"
+LEGACY_REPO_FILE="$SCRIPT_DIR/.devcontainer-repo"
+
+# Prefer /usr/bin/python3 (~14ms startup) over PATH python3, which may be a
+# slow pyenv/asdf shim (~150ms per spawn; `ensure` spawns python3 ~25x).
+# macOS: without CLT, /usr/bin/python3 is a stub that opens an install
+# dialog — gate on xcode-select before executing it. The version probe
+# keeps an old system python (e.g. RHEL 8's 3.6) from shadowing a newer
+# PATH python3; host scripts need 3.9+ (the macOS CLT interpreter).
+PYTHON_BIN=python3
+if [ -x /usr/bin/python3 ] \
+  && { [ "$(uname -s)" != "Darwin" ] || xcode-select -p >/dev/null 2>&1; } \
+  && /usr/bin/python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' 2>/dev/null; then
+  PYTHON_BIN=/usr/bin/python3
+fi
+
+# Parse flags.
+#
+# Unknown flags are REJECTED, not ignored. This loop previously matched only
+# --force and let everything else fall through, so `innoclaude update --branch
+# foo` looked accepted while the flag was simply discarded — the run then went
+# on to update to whatever the stored pin or `latest` resolved to, exit 0, and
+# never mention `foo`. Succeeding at the wrong thing is the failure mode here.
+#
+# The confusing "Failed to clone version 'v0.0.4'" reported alongside it did NOT
+# come from the dropped flag. `update` reads ${VERSION:-}, and VERSION is set
+# machine-wide by the enterprise Claude Code managed settings — so it fires with
+# no flags at all, on any managed machine, and `make dev-update` cannot honour a
+# pin there at all (dev-container.mk uses `VERSION ?=`, which leaves an
+# environment value in place). That is its own defect; it is not this one.
+#
+# Version, branch and tag selection all come from .devcontainer-version, never
+# from flags, so any flag beyond --force is a mistake worth naming.
+FORCE=false
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    # Fall through to the command dispatch, whose default arm prints usage.
+    -h|--help) ;;
+    -*)
+      echo "ERROR: unknown option '$arg'" >&2
+      echo "Supported: --force" >&2
+      # Point only at the pin file. VERSION=/BRANCH= are read by `update`
+      # alone — `ensure` ignores them entirely — and neither can name a tag:
+      # VERSION= gets a `v` prefixed to it, so VERSION=rc.2-v1.4.0 asks for
+      # `vrc.2-v1.4.0` and fails. The file is the one answer true everywhere.
+      echo "Version, branch and tag selection all come from" >&2
+      echo "  $VERSION_FILE" >&2
+      echo "  e.g. '1.3.0', 'branch:develop', or 'tag:rc.2-v1.4.0'" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# --- JSON deep merge via python3 (zero external dependencies) ---
+# 3-layer merge: base/devcontainer-template.json
+#   → company/devcontainer-overrides.json (if exists, from overlay)
+#     → project/devcontainer-overrides.json (if exists, team customizations)
+#       = devcontainer.json
+merge_devcontainer() {
+  local template="$BASE_DIR/devcontainer-template.json"
+  local company_overrides="$SCRIPT_DIR/company/devcontainer-overrides.json"
+  local project_overrides="$SCRIPT_DIR/project/devcontainer-overrides.json"
+  local local_overrides="$SCRIPT_DIR/local/devcontainer-overrides.json"
+  local output="$SCRIPT_DIR/devcontainer.json"
+
+  # Migration: move legacy overrides file to project/ if it exists
+  local legacy_overrides="$SCRIPT_DIR/devcontainer-overrides.json"
+  if [ -f "$legacy_overrides" ] && [ ! -f "$project_overrides" ]; then
+    mkdir -p "$SCRIPT_DIR/project"
+    mv "$legacy_overrides" "$project_overrides"
+    echo "innoclaude: migrated devcontainer-overrides.json → project/devcontainer-overrides.json"
+  fi
+
+  if [ ! -f "$template" ]; then
+    echo "ERROR: base/devcontainer-template.json not found" >&2
+    return 1
+  fi
+
+  # If no override files exist, copy template as-is
+  if [ ! -f "$company_overrides" ] && [ ! -f "$project_overrides" ] && [ ! -f "$local_overrides" ]; then
+    if cmp -s "$template" "$output"; then
+      :  # identical, skip write
+    else
+      cp "$template" "$output"
+    fi
+    return
+  fi
+
+  if ! command -v "$PYTHON_BIN" &>/dev/null; then
+    echo "ERROR: python3 is required for devcontainer.json generation." >&2
+    echo "It should be pre-installed on macOS and Linux." >&2
+    return 1
+  fi
+
+  # N-way merge: template + company + project + local overrides (each if it exists).
+  # Order is precedence: later layers win on conflicts.
+  "$PYTHON_BIN" "$BASE_DIR/scripts/util/merge_devcontainer.py" \
+    "$template" \
+    "$company_overrides" \
+    "$project_overrides" \
+    "$local_overrides" \
+    "$output"
+
+  if [ $? -ne 0 ]; then
+    echo "ERROR: devcontainer.json generation failed. Your existing devcontainer.json is preserved." >&2
+    echo "  Check your JSON syntax in:" >&2
+    echo "    - $template" >&2
+    [ -f "$company_overrides" ] && echo "    - $company_overrides" >&2
+    [ -f "$project_overrides" ] && echo "    - $project_overrides" >&2
+    [ -f "$local_overrides" ] && echo "    - $local_overrides" >&2
+    return 1
+  fi
+}
+
+# --- Patch devcontainer.json mount sources for per-project seal isolation ---
+patch_seal_dir() {
+  local output="$SCRIPT_DIR/devcontainer.json"
+  [ -f "$output" ] || return 0
+
+  # Compute seal slug using canonical script
+  local slug
+  slug=$("$PYTHON_BIN" "$BASE_DIR/scripts/firewall/seal_slug.py")
+  if [ -z "$slug" ]; then
+    echo "WARNING: Could not compute seal slug, skipping seal dir patch" >&2
+    return 0
+  fi
+
+  "$PYTHON_BIN" "$BASE_DIR/scripts/util/patch_seal_dir.py" "$output" "$slug"
+}
+
+# --- Portable sed -i (macOS BSD sed requires -i '' while GNU sed uses -i) ---
+sed_inplace() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    sed -i '' "$@"
+  else
+    sed -i "$@"
+  fi
+}
+
+# --- Migrate Makefile to wildcard include ---
+migrate_makefile_includes() {
+  local makefile="$SCRIPT_DIR/../Makefile"
+  local wildcard='-include .devcontainer/base/mk/dev-*.mk'
+  local features_wildcard='-include .devcontainer/base/mk/features/dev-*.mk'
+
+  [ -f "$makefile" ] || return 0
+
+  # If base wildcard already present, just ensure features wildcard is too
+  if grep -qF -- "$wildcard" "$makefile" 2>/dev/null; then
+    if ! grep -qF -- "$features_wildcard" "$makefile" 2>/dev/null; then
+      # Add features wildcard after the base wildcard line (awk — \n in sed replacement breaks macOS BSD sed)
+      awk -v line="$features_wildcard" '{print} /^-include .devcontainer\/base\/mk\/dev-\*\.mk$/{print line}' "$makefile" > "$makefile.tmp" \
+        && mv "$makefile.tmp" "$makefile"
+      echo "innoclaude: added features wildcard include to Makefile"
+    fi
+    return 0
+  fi
+
+  # Has explicit includes — migrate to wildcard
+  if grep -q '^-\{0,1\}include .devcontainer/\(base/\)\{0,1\}mk/dev-.*\.mk$' "$makefile" 2>/dev/null; then
+    sed_inplace '/^-\{0,1\}include .devcontainer\/\(base\/\)\{0,1\}mk\/dev-.*\.mk$/d' "$makefile"
+    # Remove leftover blank lines and old comment
+    sed_inplace '/^# DevContainer Targets (imported from/d' "$makefile"
+    printf '\n# DevContainer targets (wildcard picks up all base and feature .mk files)\n%s\n%s\n' "$wildcard" "$features_wildcard" >> "$makefile"
+    echo "innoclaude: migrated Makefile to wildcard include"
+  fi
+}
+
+# Save original args for re-exec after self-update
+ORIG_ARGS=("$@")
+
+# --- Self-update: overwrite this wrapper from the fetched repo, then re-exec ---
+self_update() {
+  local fetched_wrapper="$1"
+  [ -f "$fetched_wrapper" ] || return 0
+
+  # Never replace this wrapper with one that cannot read the pin we will be
+  # running under. Fetching a `tag:` pin means fetching a ref whose own wrapper
+  # may predate the form — as this ships, EVERY tag in the repo does — and
+  # copying it in would downgrade the project into a state where its own pin is
+  # a hard error on the next `ensure`, which is how `make dev-up` and the
+  # container's postStart begin. Same reasoning as the capability probe in
+  # quick-install.sh, for the two paths that reach here instead.
+  #
+  # NEW_VERSION is set by `update` (the pin it is about to write) and unset by
+  # `ensure` (the pin file is already current), so this reads whichever applies.
+  local effective_pin="${NEW_VERSION:-}"
+  [ -n "$effective_pin" ] || effective_pin="$(head -1 "$VERSION_FILE" 2>/dev/null || echo "")"
+  case "$effective_pin" in
+    tag:*)
+      if ! grep -q 'tag:\*' "$fetched_wrapper"; then
+        echo "innoclaude: keeping this wrapper — the one in the fetched ref predates 'tag:' pins," >&2
+        echo "            and replacing it would make '${effective_pin}' unreadable on the next run." >&2
+        return 0
+      fi
+      ;;
+  esac
+
+  # Guard: only re-exec once per invocation chain to prevent infinite loops
+  # (can happen when the remote tag resolves to different content across clones)
+  if [ "${_INNOCLAUDE_REEXECED:-}" = "1" ]; then
+    if ! cmp -s "$fetched_wrapper" "$SCRIPT_DIR/innoclaude"; then
+      cp "$fetched_wrapper" "$SCRIPT_DIR/innoclaude"
+      chmod +x "$SCRIPT_DIR/innoclaude"
+    fi
+    return 0
+  fi
+
+  if ! cmp -s "$fetched_wrapper" "$SCRIPT_DIR/innoclaude"; then
+    # Persist repo URL before re-exec so the new wrapper can find it
+    if [ -n "${REMOTE_URL:-}" ]; then
+      if [ -f "$CONFIG_FILE" ]; then
+        grep -q '^repo:' "$CONFIG_FILE" 2>/dev/null || echo "repo:${REMOTE_URL}" >> "$CONFIG_FILE"
+      else
+        echo "repo:${REMOTE_URL}" > "$CONFIG_FILE"
+      fi
+    fi
+    cp "$fetched_wrapper" "$SCRIPT_DIR/innoclaude"
+    chmod +x "$SCRIPT_DIR/innoclaude"
+    echo "innoclaude: wrapper updated — re-executing with new version"
+    # Strip --force: base/ is already updated; the re-exec'd wrapper only needs
+    # to apply transforms and exit via the fast path. Propagating --force would
+    # bypass the version-match check and re-fetch, risking an infinite loop when
+    # two repos carry different wrapper files.
+    local reexec_args=()
+    for arg in "${ORIG_ARGS[@]}"; do
+      [[ "$arg" != "--force" ]] && reexec_args+=("$arg")
+    done
+    export _INNOCLAUDE_REEXECED=1
+    exec "$SCRIPT_DIR/innoclaude" "${reexec_args[@]}"
+  fi
+}
+
+# --- Extract enabled feature IDs from template + overrides (source files) ---
+# Safe to call at any pipeline stage since it reads source files, not generated output.
+get_enabled_feature_ids() {
+  "$PYTHON_BIN" -c "
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from jsonc import load_jsonc_optional  # full-line // only, URL-safe
+features = set()
+for path in sys.argv[2:]:
+    if not os.path.isfile(path): continue
+    try: cfg = load_jsonc_optional(path) or {}
+    except Exception: continue
+    for key in cfg.get('features', {}):
+        parts = key.rstrip('/').split('/')
+        if parts: features.add(parts[-1])
+for f in sorted(features): print(f)
+  " "$BASE_DIR/scripts/util" "$BASE_DIR/devcontainer-template.json" "$SCRIPT_DIR/company/devcontainer-overrides.json" "$SCRIPT_DIR/project/devcontainer-overrides.json" "$SCRIPT_DIR/local/devcontainer-overrides.json"
+}
+
+# --- Copy missing files from a source directory to project/ ---
+_scaffold_from_dir() {
+  local src_dir="$1" target_dir="$2"
+  [ -d "$src_dir" ] || return 0
+  mkdir -p "$target_dir"
+  while IFS= read -r src_file; do
+    local rel_path="${src_file#$src_dir/}"
+    local dest="$target_dir/$rel_path"
+    if [ ! -f "$dest" ]; then
+      mkdir -p "$(dirname "$dest")"
+      cp "$src_file" "$dest"
+      echo "innoclaude: created default project/$rel_path"
+    fi
+  done < <(find "$src_dir" -type f)
+}
+
+# --- Scaffold missing project overlay files from base + enabled features ---
+scaffold_project_files() {
+  local target_dir="$SCRIPT_DIR/project"
+
+  # Phase 1: Core project defaults
+  _scaffold_from_dir "$BASE_DIR/project-defaults" "$target_dir"
+
+  # Phase 2: Enabled feature project defaults (base + company features)
+  for fid in $(get_enabled_feature_ids); do
+    _scaffold_from_dir "$BASE_DIR/features/$fid/project-defaults" "$target_dir"
+    _scaffold_from_dir "$SCRIPT_DIR/company/features/$fid/project-defaults" "$target_dir"
+  done
+}
+
+# --- Scaffold the developer-local overlay skeleton ---
+scaffold_local_files() {
+  local d="$SCRIPT_DIR/local"
+  mkdir -p "$d/configs/mcp" "$d/scripts/lifecycle"
+
+  _write_local_if_missing() {
+    local path="$1" content="$2"
+    [ -f "$path" ] && return 0
+    printf '%s\n' "$content" > "$path"
+    echo "innoclaude: created local/${path#$d/}"
+  }
+
+  _write_local_if_missing "$d/README.md" "# Developer-Local Overlay
+
+Per-machine overrides for this devcontainer. This entire directory is
+git-ignored (\`.devcontainer/local/\`), so nothing here is committed or
+modified by base updates. It is scaffolded automatically and layered last,
+after \`base/\` and \`project/\`, so local settings win.
+
+## Files
+
+- \`devcontainer-overrides.json\` — per-machine devcontainer.json overrides (merged last)
+- \`configs/bashrc_custom\` — shell configuration sourced on login, after the project bashrc_custom
+- \`configs/firewall/firewall-allowlist-local.json\` — additional firewall domains (created on first edit)
+- \`configs/mcp/\` — per-machine MCP server configurations
+- \`Dockerfile.local\` — extra image build steps (appended after the project steps)
+- \`scripts/local-install.sh\` — one-time installs with full network (before firewall)
+- \`scripts/lifecycle/post-create.sh\` — runs after container creation (first time), after the project hook
+- \`scripts/lifecycle/post-start.sh\` — runs after every container start, after the project hook"
+  _write_local_if_missing "$d/devcontainer-overrides.json" "{}"
+  _write_local_if_missing "$d/configs/bashrc_custom" "# Developer-local shell configuration
+# Sourced by .bashrc on every login, after the project bashrc_custom."
+
+  for hook in post-create post-start; do
+    local hp="$d/scripts/lifecycle/$hook.sh"
+    [ -f "$hp" ] && continue
+    printf '%s\n' "#!/bin/bash
+# Developer-local $hook hook (git-ignored). Runs after the project hook." > "$hp"
+    chmod +x "$hp"
+    echo "innoclaude: created local/scripts/lifecycle/$hook.sh"
+  done
+
+  local ip="$d/scripts/local-install.sh"
+  if [ ! -f "$ip" ]; then
+    printf '%s\n' "#!/bin/bash
+# Developer-local install hook. Runs ONCE at container creation
+# with full network access, before the firewall is activated." > "$ip"
+    chmod +x "$ip"
+    echo "innoclaude: created local/scripts/local-install.sh"
+  fi
+}
+
+# --- Read build.args from the merged devcontainer.json as `KEY=VALUE` lines ---
+_read_build_args() {
+  local dcj="$1"
+  [ -f "$dcj" ] || return 0
+  "$PYTHON_BIN" -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+from jsonc import load_jsonc_optional  # full-line // only, URL-safe
+try:
+    cfg = load_jsonc_optional(sys.argv[2]) or {}
+except Exception:
+    sys.exit(0)
+for k, v in (cfg.get('build', {}) or {}).get('args', {}).items():
+    print(f'{k}={v}')
+" "$BASE_DIR/scripts/util" "$dcj"
+}
+
+# --- Generate the devcontainer Dockerfile ---
+# Fast repeat start (issue-147): the universal toolchain + baked assistant live
+# behind a content-addressed innoclaude-foundation:<VERSION>-<hash> image, built
+# once by scripts/util/foundation_image.py and reused. The generated Dockerfile
+# is then a THIN `FROM <tag>` + the project/local build steps, so a repeat start
+# is a cache hit on the foundation and only the delta rebuilds. On ANY failure
+# (docker down, build error, helper missing) we fall back to the legacy full-base
+# Dockerfile below, so a start is never blocked — the graceful degradation the
+# fast-repeat-start guarantee (G25) requires.
+generate_dockerfile() {
+  local base_dockerfile="$BASE_DIR/Dockerfile"
+  local fi_helper="$BASE_DIR/scripts/util/foundation_image.py"
+  local generated="$SCRIPT_DIR/Dockerfile.generated"
+  local project_dockerfile="$SCRIPT_DIR/project/Dockerfile.project"
+  local local_dockerfile="$SCRIPT_DIR/local/Dockerfile.local"
+  local dcj="$SCRIPT_DIR/devcontainer.json"
+
+  if [ -f "$base_dockerfile" ] && [ -f "$fi_helper" ]; then
+    local context_dir
+    context_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+    # Collect build.args from the merged devcontainer.json (PYTHON_VERSION,
+    # CLAUDE_CODE_VERSION, an overlay's CLAUDE_DOWNLOAD_MIRROR, …) so the
+    # foundation is baked with the same knobs the devcontainer build would use.
+    local build_arg_flags=() line
+    while IFS= read -r line; do
+      [ -n "$line" ] && build_arg_flags+=(--build-arg "$line")
+    done < <(_read_build_args "$dcj")
+
+    local ensure_args=(ensure \
+      --version-file "$BASE_DIR/VERSION" \
+      --dockerfile "$base_dockerfile" \
+      --context "$context_dir")
+    if [ ${#build_arg_flags[@]} -gt 0 ]; then
+      ensure_args+=("${build_arg_flags[@]}")
+    fi
+
+    local tag
+    if tag=$("$PYTHON_BIN" "$fi_helper" "${ensure_args[@]}") && [ -n "$tag" ]; then
+      local thin_flags=(--tag "$tag")
+      [ -f "$project_dockerfile" ] && thin_flags+=(--project-dockerfile "$project_dockerfile")
+      [ -f "$local_dockerfile" ] && thin_flags+=(--local-dockerfile "$local_dockerfile")
+      local new_content
+      if new_content=$("$PYTHON_BIN" "$fi_helper" thin-dockerfile "${thin_flags[@]}"); then
+        if [ ! -f "$generated" ] || [ "$(cat "$generated")" != "$new_content" ]; then
+          printf '%s' "$new_content" > "$generated"
+          echo "innoclaude: generated Dockerfile.generated (FROM $tag)"
+        fi
+        return 0
+      fi
+    fi
+    echo "innoclaude: foundation image unavailable — building the full base directly" >&2
+  fi
+
+  # Fallback: legacy full-base Dockerfile (project/local steps before CMD).
+  _legacy_generate_dockerfile
+}
+
+# --- Legacy composite Dockerfile from project/ and/or local/ build steps ---
+# Build steps are inserted before the base image's final CMD, project first
+# then local (local is git-ignored, per-machine, and wins by running last).
+# Used as the fallback when the foundation image cannot be built.
+_legacy_generate_dockerfile() {
+  local project_dockerfile="$SCRIPT_DIR/project/Dockerfile.project"
+  local local_dockerfile="$SCRIPT_DIR/local/Dockerfile.local"
+  local base_dockerfile="$BASE_DIR/Dockerfile"
+  local generated="$SCRIPT_DIR/Dockerfile.generated"
+
+  if [ ! -f "$project_dockerfile" ] && [ ! -f "$local_dockerfile" ]; then
+    # No project or local Dockerfile — remove stale generated file if present
+    rm -f "$generated"
+    return 0
+  fi
+
+  if [ ! -f "$base_dockerfile" ]; then
+    echo "WARNING: base/Dockerfile not found, skipping Dockerfile generation" >&2
+    return 0
+  fi
+
+  # Assemble the extra build steps (project first, then local) with a header
+  # for each present layer. Tracked for the success message below.
+  local extra_steps="" sources=""
+  if [ -f "$project_dockerfile" ]; then
+    extra_steps="$(printf '\n# --- Project build steps (from project/Dockerfile.project) ---\n'
+      cat "$project_dockerfile")"
+    sources="project/Dockerfile.project"
+  fi
+  if [ -f "$local_dockerfile" ]; then
+    extra_steps="$extra_steps$(printf '\n# --- Local build steps (from local/Dockerfile.local) ---\n'
+      cat "$local_dockerfile")"
+    [ -n "$sources" ] && sources="$sources + local/Dockerfile.local" || sources="local/Dockerfile.local"
+  fi
+
+  # Read base Dockerfile and find the last CMD line number
+  local last_cmd_line
+  last_cmd_line=$(grep -n '^CMD ' "$base_dockerfile" | tail -1 | cut -d: -f1)
+
+  local new_content
+  if [ -z "$last_cmd_line" ]; then
+    echo "WARNING: No CMD line found in base/Dockerfile, appending extra Dockerfile steps at end" >&2
+    new_content="$(cat "$base_dockerfile"
+      printf '%s' "$extra_steps")"
+  else
+    # Insert extra content before the last CMD line
+    local total_lines
+    total_lines=$(wc -l < "$base_dockerfile")
+    local before_cmd=$((last_cmd_line - 1))
+
+    new_content="$(head -n "$before_cmd" "$base_dockerfile"
+      printf '%s' "$extra_steps"
+      printf '\n'
+      tail -n $((total_lines - before_cmd)) "$base_dockerfile")"
+  fi
+
+  # Compare with existing file — skip write if identical
+  if [ -f "$generated" ] && [ "$(cat "$generated")" = "$new_content" ]; then
+    return 0
+  fi
+
+  printf '%s' "$new_content" > "$generated"
+  echo "innoclaude: generated Dockerfile.generated (base + $sources)"
+}
+
+# --- Patch devcontainer.json to use generated Dockerfile if it exists ---
+patch_dockerfile_path() {
+  local output="$SCRIPT_DIR/devcontainer.json"
+  local generated="$SCRIPT_DIR/Dockerfile.generated"
+
+  [ -f "$generated" ] || return 0
+  [ -f "$output" ] || return 0
+
+  "$PYTHON_BIN" "$BASE_DIR/scripts/util/patch_dockerfile_path.py" "$output"
+}
+
+# --- Symlink feature .mk files into mk/features/ based on enabled features ---
+_relative_path() {
+  "$PYTHON_BIN" -c "import os.path,sys; print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$1" "$2"
+}
+
+sync_feature_makefiles() {
+  local link_dir="$BASE_DIR/mk/features"
+
+  # Clean and recreate symlink directory
+  rm -rf "$link_dir"
+  mkdir -p "$link_dir"
+
+  # Pass 1: Always symlink install targets (dev-install-*.mk) from ALL
+  # features — base layer and overlay-provided company features alike.
+  for feature_dir in "$BASE_DIR/features"/*/ "$SCRIPT_DIR/company/features"/*/; do
+    [ -d "$feature_dir" ] || continue
+    for mk_file in "$feature_dir"/dev-install-*.mk; do
+      [ -f "$mk_file" ] || continue
+      ln -sf "$(_relative_path "$mk_file" "$link_dir")" "$link_dir/$(basename "$mk_file")"
+    done
+  done
+
+  # Pass 2: Symlink other dev-*.mk from ENABLED features only (base + company)
+  local feature_ids
+  feature_ids=$(get_enabled_feature_ids)
+
+  for fid in $feature_ids; do
+    for feature_dir in "$BASE_DIR/features/$fid" "$SCRIPT_DIR/company/features/$fid"; do
+      [ -d "$feature_dir" ] || continue
+      for mk_file in "$feature_dir"/dev-*.mk; do
+        [ -f "$mk_file" ] || continue
+        # Skip install files (already handled in pass 1)
+        case "$(basename "$mk_file")" in dev-install-*) continue ;; esac
+        ln -sf "$(_relative_path "$mk_file" "$link_dir")" "$link_dir/$(basename "$mk_file")"
+      done
+    done
+  done
+}
+
+# --- Common helpers ---
+
+# Read a key from .devcontainer-config (key:value format, one per line)
+read_config_key() {
+  local key="$1"
+  [ -f "$CONFIG_FILE" ] || return 0
+  grep "^${key}:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed "s/^${key}://"
+}
+
+# Write or update a key in .devcontainer-config
+write_config_key() {
+  local key="$1" value="$2"
+  if [ -f "$CONFIG_FILE" ] && grep -q "^${key}:" "$CONFIG_FILE" 2>/dev/null; then
+    sed_inplace "s|^${key}:.*|${key}:${value}|" "$CONFIG_FILE"
+  elif [ -f "$CONFIG_FILE" ]; then
+    echo "${key}:${value}" >> "$CONFIG_FILE"
+  else
+    echo "${key}:${value}" > "$CONFIG_FILE"
+  fi
+}
+
+# --- The .devcontainer-version pin grammar ---
+#
+# Three forms: a bare semver, `branch:<name>`, `tag:<name>`. FOUR subcommands
+# read them — ensure, update, check-update, version — and they have to agree.
+# They did not: `tag:` was first taught to `ensure` alone, so `update` fell
+# through to its no-pin arm and silently rewrote a tag pin to a bare semver,
+# `check-update` printed `Current version: vtag:rc.2-v1.4.0`, and `version`
+# echoed the raw line. One reader, four callers, so a new form cannot again
+# be understood in one place and mangled in three.
+#
+# Sets PIN_KIND (semver|branch|tag), PIN_REF (the name as written, semver
+# without the `v`) and PIN_GIT_REF (what to hand `git clone --branch`).
+# Returns 1 on a malformed pin, having already explained it on stderr.
+classify_pin() {
+  local pin="$1" name
+  # Cleared up front so a failed call cannot leave a previous call's values
+  # visible. Callers short-circuit on the return code today; this makes that a
+  # convention rather than a requirement.
+  PIN_KIND="" PIN_REF="" PIN_GIT_REF=""
+  case "$pin" in
+    branch:*|tag:*)
+      PIN_KIND="${pin%%:*}"
+      name="${pin#*:}"
+      if [ -z "$name" ]; then
+        echo "ERROR: Empty ${PIN_KIND} name in .devcontainer-version" >&2
+        return 1
+      fi
+      # A ref may not begin with `-` (git rejects such names), and this value
+      # is passed to `git clone --branch`, so refusing it here keeps a pin
+      # file from putting anything option-shaped on a git command line.
+      case "$name" in
+        -*)
+          echo "ERROR: ${PIN_KIND} name in .devcontainer-version may not start with '-': '$name'" >&2
+          return 1
+          ;;
+      esac
+      PIN_REF="$name"
+      PIN_GIT_REF="$name"
+      ;;
+    *)
+      if ! echo "$pin" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+        echo "ERROR: Invalid version format in .devcontainer-version: '$pin'" >&2
+        echo "Expected semver (e.g. 1.0.0), branch:<name>, or tag:<name>" >&2
+        echo "  Release candidates are tags, not versions: tag:rc.2-v1.4.0" >&2
+        return 1
+      fi
+      PIN_KIND=semver
+      PIN_REF="$pin"
+      PIN_GIT_REF="v${pin}"
+      ;;
+  esac
+}
+
+# Resolve the base repo URL from config file, legacy file, env var, or interactive prompt.
+parse_repo_url() {
+  local url
+
+  # Primary: .devcontainer-config
+  url=$(read_config_key "repo")
+  if [ -n "$url" ]; then
+    echo "$url"
+    return
+  fi
+
+  # Migration: legacy .devcontainer-repo
+  if [ -f "$LEGACY_REPO_FILE" ]; then
+    url=$(head -1 "$LEGACY_REPO_FILE")
+    if [ -n "$url" ]; then
+      write_config_key "repo" "$url"
+      echo "innoclaude: migrated repo URL to .devcontainer-config" >&2
+      echo "$url"
+      return
+    fi
+  fi
+
+  # Env var fallback
+  if [ -n "${INNOCLAUDE_GIT_URL:-}" ]; then
+    echo "$INNOCLAUDE_GIT_URL"
+    return
+  fi
+
+  # Interactive prompt
+  if [ -t 0 ]; then
+    echo "" >&2
+    echo "No repo URL configured." >&2
+    echo "Please enter the devcontainer-base repo URL" >&2
+    read -rp "(e.g. git@github.com:your-org/your-devcontainer.git): " url >&2
+    if [ -z "$url" ]; then
+      echo "ERROR: No URL provided." >&2
+      return 1
+    fi
+    write_config_key "repo" "$url"
+    echo "Saved to .devcontainer/.devcontainer-config" >&2
+    echo "$url"
+  else
+    echo "ERROR: No repo URL configured." >&2
+    echo "  Create .devcontainer/.devcontainer-config with 'repo:<url>'," >&2
+    echo "  or set INNOCLAUDE_GIT_URL in your environment." >&2
+    return 1
+  fi
+}
+
+# Resolve overlay URL from config file, with migration from legacy locations.
+parse_overlay_url() {
+  local url
+
+  # Primary: .devcontainer-config
+  url=$(read_config_key "overlay")
+  if [ -n "$url" ]; then
+    echo "$url"
+    return
+  fi
+
+  # Migration: overlay line in .devcontainer-version
+  url=$(grep '^overlay:' "$VERSION_FILE" 2>/dev/null | head -1 | sed 's/^overlay://' || true)
+  if [ -n "$url" ]; then
+    write_config_key "overlay" "$url"
+    echo "innoclaude: migrated overlay URL from .devcontainer-version to .devcontainer-config" >&2
+    echo "$url"
+    return
+  fi
+
+  # Migration: legacy .overlay-url cache file (pre-1.2 location)
+  local cache_file="$SCRIPT_DIR/company/.overlay-url"
+  if [ -f "$cache_file" ]; then
+    url=$(cat "$cache_file")
+    if [ -n "$url" ]; then
+      write_config_key "overlay" "$url"
+      echo "innoclaude: migrated overlay URL from .overlay-url to .devcontainer-config" >&2
+      echo "$url"
+      return
+    fi
+  fi
+}
+
+# Apply the full transform pipeline: overlay → scaffold → merge → dockerfile → patch → makefiles → symlinks
+apply_transforms() {
+  local overlay_url
+  overlay_url=$(parse_overlay_url)
+
+  # One-time cleanup: remove overlay line from .devcontainer-version after migration
+  if grep -q '^overlay:' "$VERSION_FILE" 2>/dev/null && [ -n "$(read_config_key "overlay")" ]; then
+    sed_inplace '/^overlay:/d' "$VERSION_FILE"
+  fi
+
+  # Apply overlay from config (always re-applies to pick up URL changes)
+  if [ -n "$overlay_url" ]; then
+    echo "innoclaude: re-applying overlay from $overlay_url"
+    "$PYTHON_BIN" "$BASE_DIR/scripts/overlay/install_overlay.py" "$overlay_url"
+  fi
+  scaffold_project_files
+  scaffold_local_files
+  merge_devcontainer
+  patch_seal_dir
+  sync_feature_makefiles
+  generate_dockerfile
+  patch_dockerfile_path
+  migrate_makefile_includes
+}
+
+# Create a temp directory with automatic cleanup on exit
+setup_temp_dir() {
+  TEMP_DIR=$(mktemp -d)
+  trap "rm -rf '$TEMP_DIR'" EXIT
+}
+
+# --- Host shell completion ---
+
+COMPLETION_MARKER="# innoclaude-devcontainer-completion"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+COMPLETION_FILE="$BASE_DIR/configs/shell-completion/make-devcontainer"
+
+# Detect the user's login shell rc file
+_shell_rc_file() {
+  case "$(basename "${SHELL:-/bin/bash}")" in
+    zsh)  echo "$HOME/.zshrc" ;;
+    *)    echo "$HOME/.bashrc" ;;
+  esac
+}
+
+# Check if completion is already installed
+_completion_installed() {
+  local rc_file
+  rc_file="$(_shell_rc_file)"
+  [ -f "$rc_file" ] && grep -qF "$COMPLETION_MARKER" "$rc_file" 2>/dev/null
+}
+
+# Install completion sourcing block into the user's shell rc
+install_completion() {
+  if _completion_installed; then
+    echo "innoclaude: shell completion is already installed."
+    return 0
+  fi
+
+  local rc_file
+  rc_file="$(_shell_rc_file)"
+  local completion_path="$WORKSPACE_ROOT/.devcontainer/base/configs/shell-completion/make-devcontainer"
+
+  cat >> "$rc_file" << EOF
+
+$COMPLETION_MARKER
+if [ -f "$completion_path" ]; then
+    source "$completion_path"
+fi
+EOF
+  echo "innoclaude: tab completion installed in $rc_file"
+  echo "  Restart your shell or run: source $rc_file"
+}
+
+# Remove completion sourcing block from shell rc files
+remove_completion() {
+  local removed=false
+  for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [ -f "$rc_file" ] && grep -qF "$COMPLETION_MARKER" "$rc_file" 2>/dev/null; then
+      # Remove the marker line and the if/fi block that follows
+      if [ "$(uname -s)" = "Darwin" ]; then
+        sed -i '' "/$COMPLETION_MARKER/,/^fi$/d" "$rc_file"
+        # Also remove the blank line before the block
+        sed -i '' '/^$/N;/\n$/d' "$rc_file"
+      else
+        sed -i "/$COMPLETION_MARKER/,/^fi$/d" "$rc_file"
+      fi
+      echo "innoclaude: removed completion from $rc_file"
+      removed=true
+    fi
+  done
+  if [ "$removed" = "false" ]; then
+    echo "innoclaude: no completion found to remove."
+  fi
+}
+
+# Offer to install completion (interactive, with guards)
+offer_host_completion() {
+  # Skip in non-interactive contexts
+  [ -t 0 ] || return 0
+  # Skip inside containers
+  [ -f "/.dockerenv" ] && return 0
+  [ -n "${DEVCONTAINER:-}" ] && return 0
+  # Skip if already installed
+  _completion_installed && return 0
+  # Skip if completion file doesn't exist yet
+  [ -f "$COMPLETION_FILE" ] || return 0
+
+  echo ""
+  read -p "Install tab completion for 'make dev-*' commands? [y/N]: " answer
+  case "$answer" in
+    y|Y) install_completion ;;
+    *)   echo "  Skipped. You can install later with: make dev-install-completion" ;;
+  esac
+}
+
+# --- Command dispatch ---
+cmd="${1:-ensure}"
+
+case "$cmd" in
+  ensure)
+    PINNED_VERSION=$(head -1 "$VERSION_FILE" 2>/dev/null || echo "")
+    if [ -z "$PINNED_VERSION" ]; then
+      echo "ERROR: .devcontainer-version not found or empty" >&2
+      exit 1
+    fi
+
+    # Release-candidate tags use a PREFIX scheme (rc.N-v<version>), so they are
+    # neither semver nor a branch and were previously unpinnable: `branch:` was
+    # the only escape hatch. It works, because `git clone --branch` accepts a
+    # tag — but it records an immutable ref as a moving one.
+    classify_pin "$PINNED_VERSION" || exit 1
+    REF_KIND="$PIN_KIND"
+    BRANCH_NAME="$PIN_REF"
+    GIT_REF="$PIN_GIT_REF"
+    # "Branch mode" here means "fetch a named ref rather than a version", which
+    # is true of a tag too. It is NOT a claim that the ref is correct on disk —
+    # see the fast path below.
+    BRANCH_MODE=false
+    [ "$PIN_KIND" = "semver" ] || BRANCH_MODE=true
+
+    # Fast path: version matches (for semver) or base/ exists (for branches)
+    if [ -f "$BASE_DIR/VERSION" ]; then
+      CURRENT_VERSION=$(cat "$BASE_DIR/VERSION")
+      if [ "$BRANCH_MODE" = "true" ]; then
+        # Branch mode: base/ exists, skip unless --force
+        if [ "$FORCE" != "true" ]; then
+          apply_transforms
+          echo "innoclaude: base pinned to ${REF_KIND} '${BRANCH_NAME}' is present (use --force to re-fetch)."
+          exit 0
+        fi
+        echo "innoclaude: re-fetching ${REF_KIND} '${BRANCH_NAME}' (--force)..."
+      elif [ "$CURRENT_VERSION" = "$PINNED_VERSION" ] && [ "$FORCE" != "true" ]; then
+        apply_transforms
+        echo "innoclaude: base v${PINNED_VERSION} is up to date."
+        exit 0
+      elif [ "$FORCE" = "true" ]; then
+        echo "innoclaude: re-fetching v${PINNED_VERSION} (--force)..."
+      else
+        echo "innoclaude: version mismatch (have: $CURRENT_VERSION, want: $PINNED_VERSION). Re-fetching..."
+      fi
+    else
+      if [ "$BRANCH_MODE" = "true" ]; then
+        echo "innoclaude: base/ not found. Fetching ${REF_KIND} '${BRANCH_NAME}'..."
+      else
+        echo "innoclaude: base/ not found. Fetching v${PINNED_VERSION}..."
+      fi
+    fi
+
+    # Self-detection: if base/ is tracked by git AND present on disk, we're inside
+    # the devcontainer-base repo itself — skip the remote fetch and use local base/
+    # (The -d check prevents false positives when base/ is in the git index but was
+    # deleted from the working tree, e.g. during quick-install into a repo checkout.)
+    if [ -d "$BASE_DIR" ] && git -C "$SCRIPT_DIR" ls-files --error-unmatch base/VERSION &>/dev/null; then
+      echo "innoclaude: running inside devcontainer-base repo — using local base/"
+      apply_transforms
+      exit 0
+    fi
+
+    # Acquire lock (Linux: flock, macOS: rely on atomic mv)
+    LOCK_FILE="$SCRIPT_DIR/.innoclaude.lock"
+    if command -v flock &>/dev/null; then
+      exec 200>"$LOCK_FILE"
+      flock -n 200 || { echo "innoclaude: another instance is running, waiting..."; flock 200; }
+    fi
+
+    # Resolve repo URL (from .devcontainer-repo or INNOCLAUDE_GIT_URL)
+    REMOTE_URL=$(parse_repo_url) || exit 1
+
+    # Fetch to temp directory
+    setup_temp_dir
+
+    echo "innoclaude: cloning ${REMOTE_URL} @ ${GIT_REF}..."
+
+    if ! git clone --depth 1 --branch "$GIT_REF" "$REMOTE_URL" "$TEMP_DIR/repo" 2>&1; then
+      echo "ERROR: Failed to clone devcontainer-base @ ${GIT_REF}" >&2
+      echo "Check: SSH key access, network connectivity, and that tag '${GIT_REF}' exists." >&2
+      exit 1
+    fi
+
+    # Extract .devcontainer/base/ contents → base/
+    if [ ! -d "$TEMP_DIR/repo/.devcontainer/base" ]; then
+      echo "ERROR: Cloned repo does not contain .devcontainer/base/ directory" >&2
+      exit 1
+    fi
+
+    # Atomic replacement
+    rm -rf "$BASE_DIR"
+    mv "$TEMP_DIR/repo/.devcontainer/base" "$BASE_DIR"
+
+    # Self-update wrapper from fetched repo
+    self_update "$TEMP_DIR/repo/.devcontainer/innoclaude"
+
+    # Verify version (skip mismatch warning for branch-pinned)
+    FETCHED_VERSION=$(cat "$BASE_DIR/VERSION" 2>/dev/null || echo "")
+    if [ "$BRANCH_MODE" != "true" ] && [ "$FETCHED_VERSION" != "$PINNED_VERSION" ]; then
+      echo "WARNING: Fetched version ($FETCHED_VERSION) does not match pinned ($PINNED_VERSION)" >&2
+    fi
+
+    # Apply all transforms
+    apply_transforms
+
+    if [ "$BRANCH_MODE" = "true" ]; then
+      echo "innoclaude: base from ${REF_KIND} '${BRANCH_NAME}' installed successfully."
+    else
+      echo "innoclaude: base v${PINNED_VERSION} installed successfully."
+    fi
+
+    # Offer completion on first install
+    offer_host_completion
+    ;;
+
+  update)
+    REMOTE_URL=$(parse_repo_url) || exit 1
+
+    # Parse arguments from environment (set by Make targets)
+    TARGET_VERSION="${VERSION:-}"
+    TARGET_BRANCH="${BRANCH:-}"
+
+    # Default to the stored ref pin when no explicit version/branch was given.
+    # A tag pin has to be honoured here as well as a branch pin: without this,
+    # `make dev-update` on a tag-pinned project fell through to the `latest`
+    # arm below and rewrote .devcontainer-version from `tag:rc.2-v1.4.0` to a
+    # bare release version — silently moving the project off the very release
+    # candidate the pin named, while the `branch:` workaround it replaces
+    # survived untouched.
+    TARGET_TAG=""
+    if [ -z "$TARGET_VERSION" ] && [ -z "$TARGET_BRANCH" ]; then
+      STORED_VERSION=$(head -1 "$VERSION_FILE" 2>/dev/null || echo "")
+      if [ -n "$STORED_VERSION" ] && classify_pin "$STORED_VERSION" 2>/dev/null; then
+        case "$PIN_KIND" in
+          branch)
+            TARGET_BRANCH="$PIN_REF"
+            echo "innoclaude: .devcontainer-version pins branch '${TARGET_BRANCH}', updating..."
+            ;;
+          tag)
+            TARGET_TAG="$PIN_REF"
+            echo "innoclaude: .devcontainer-version pins tag '${TARGET_TAG}', re-fetching it."
+            echo "            A tag is immutable, so this keeps you where you are."
+            echo "            To move to the newest release: make dev-update VERSION=latest"
+            ;;
+        esac
+      fi
+    fi
+
+    if [ -n "$TARGET_TAG" ]; then
+      # Tag mode: same fetch as a branch, but the pin stays a tag.
+      echo "innoclaude: fetching tag '$TARGET_TAG'..."
+      setup_temp_dir
+
+      if ! git clone --depth 1 --branch "$TARGET_TAG" "$REMOTE_URL" "$TEMP_DIR/repo" 2>&1; then
+        echo "ERROR: Failed to clone tag '$TARGET_TAG'" >&2
+        exit 1
+      fi
+      NEW_VERSION="tag:${TARGET_TAG}"
+
+    elif [ -n "$TARGET_BRANCH" ]; then
+      # Branch mode: clone branch, use whatever version is in it
+      echo "innoclaude: fetching branch '$TARGET_BRANCH'..."
+      setup_temp_dir
+
+      if ! git clone --depth 1 --branch "$TARGET_BRANCH" "$REMOTE_URL" "$TEMP_DIR/repo" 2>&1; then
+        echo "ERROR: Failed to clone branch '$TARGET_BRANCH'" >&2
+        exit 1
+      fi
+      NEW_VERSION="branch:${TARGET_BRANCH}"
+
+    elif [ "$TARGET_VERSION" = "latest" ] || [ -z "$TARGET_VERSION" ]; then
+      # Resolve latest tag
+      echo "innoclaude: resolving latest version..."
+      # Only `v<semver>` tags are candidates for "latest" — same filter as
+      # quick-install.sh. Without it a prerelease in that namespace (v1.4.1-b1)
+      # sorts AFTER the release under `sort -V` and silently becomes "latest"
+      # for every consumer running `make dev-update VERSION=latest`.
+      LATEST_TAG=$(git ls-remote --tags "$REMOTE_URL" 'refs/tags/v*' 2>/dev/null | \
+        awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' | \
+        grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+      if [ -z "$LATEST_TAG" ]; then
+        echo "ERROR: No version tags found on remote" >&2
+        exit 1
+      fi
+      NEW_VERSION="${LATEST_TAG#v}"
+      echo "innoclaude: latest version is v${NEW_VERSION}"
+      TARGET_VERSION="$NEW_VERSION"
+
+      setup_temp_dir
+      if ! git clone --depth 1 --branch "$LATEST_TAG" "$REMOTE_URL" "$TEMP_DIR/repo" 2>&1; then
+        echo "ERROR: Failed to clone tag '$LATEST_TAG'" >&2
+        exit 1
+      fi
+
+    else
+      # Specific version
+      NEW_VERSION="${TARGET_VERSION#v}"
+      setup_temp_dir
+      if ! git clone --depth 1 --branch "v${NEW_VERSION}" "$REMOTE_URL" "$TEMP_DIR/repo" 2>&1; then
+        echo "ERROR: Failed to clone version 'v${NEW_VERSION}'" >&2
+        exit 1
+      fi
+    fi
+
+    # Save old devcontainer.json for diff
+    OLD_DCJ=""
+    if [ -f "$SCRIPT_DIR/devcontainer.json" ]; then
+      OLD_DCJ=$(mktemp)
+      cp "$SCRIPT_DIR/devcontainer.json" "$OLD_DCJ"
+    fi
+
+    # Replace base/
+    rm -rf "$BASE_DIR"
+    mv "$TEMP_DIR/repo/.devcontainer/base" "$BASE_DIR"
+
+    # Self-update wrapper from fetched repo
+    self_update "$TEMP_DIR/repo/.devcontainer/innoclaude"
+
+    # Apply all transforms
+    apply_transforms
+
+    # Show diff
+    if [ -n "$OLD_DCJ" ] && [ -f "$OLD_DCJ" ]; then
+      echo ""
+      echo "=== devcontainer.json changes ==="
+      diff --color=auto "$OLD_DCJ" "$SCRIPT_DIR/devcontainer.json" || true
+      rm -f "$OLD_DCJ"
+    fi
+
+    # Update .devcontainer-version (version only; overlay is in .devcontainer-config)
+    echo "$NEW_VERSION" > "$VERSION_FILE"
+
+    echo ""
+    if [[ "$NEW_VERSION" == branch:* ]]; then
+      echo "innoclaude: updated to branch '${NEW_VERSION#branch:}'."
+    elif [[ "$NEW_VERSION" == tag:* ]]; then
+      echo "innoclaude: updated to tag '${NEW_VERSION#tag:}'."
+    else
+      echo "innoclaude: updated to v${NEW_VERSION}."
+    fi
+    echo "Commit .devcontainer-version to pin this version."
+    ;;
+
+  check-update)
+    REMOTE_URL=$(parse_repo_url) || exit 1
+    CURRENT=$(head -1 "$VERSION_FILE" 2>/dev/null || echo "unknown")
+
+    # Ref-pinned (branch or tag): a release comparison is meaningless. Without
+    # the tag arm this printed `Current version: vtag:rc.2-v1.4.0` and then
+    # recommended the update that used to discard the pin.
+    if [ "$CURRENT" != "unknown" ] && classify_pin "$CURRENT" 2>/dev/null \
+       && [ "$PIN_KIND" != "semver" ]; then
+      echo "Currently pinned to ${PIN_KIND} '${PIN_REF}'."
+      if [ "$PIN_KIND" = "branch" ]; then
+        echo "Branch-pinned versions track the branch head; run 'innoclaude ensure --force' to re-fetch."
+      else
+        echo "Tag-pinned versions are immutable; 'make dev-update' re-fetches the same tag."
+      fi
+      echo ""
+      echo "To switch back to release tracking: make dev-update VERSION=latest"
+      exit 0
+    fi
+
+    echo "Current version: v${CURRENT}"
+
+    echo "Checking remote tags..."
+    # Release tags only — see the note in the `latest` arm of `update`.
+    TAGS=$(git ls-remote --tags "$REMOTE_URL" 'refs/tags/v*' 2>/dev/null | \
+      awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' | \
+      grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V) || true
+
+    if [ -z "$TAGS" ]; then
+      echo "No version tags found on remote."
+      exit 0
+    fi
+
+    LATEST=$(echo "$TAGS" | tail -1)
+    LATEST_NUM="${LATEST#v}"
+
+    if [ "$LATEST_NUM" = "$CURRENT" ]; then
+      echo "You are on the latest version."
+    else
+      echo "Latest version: ${LATEST} (you have: v${CURRENT})"
+      echo ""
+      echo "To update: make dev-update VERSION=latest"
+      echo "Or:        make dev-update VERSION=${LATEST}"
+    fi
+
+    # Show changelog excerpt if available
+    if [ -f "$BASE_DIR/CHANGELOG.md" ]; then
+      echo ""
+      echo "=== Recent changelog ==="
+      head -30 "$BASE_DIR/CHANGELOG.md"
+    fi
+    ;;
+
+  version)
+    VER=$(head -1 "$VERSION_FILE" 2>/dev/null || echo "unknown")
+    if [[ "$VER" == branch:* ]]; then
+      echo "branch: ${VER#branch:}"
+    elif [[ "$VER" == tag:* ]]; then
+      echo "tag: ${VER#tag:}"
+    else
+      echo "$VER"
+    fi
+    ;;
+
+  install-completion)
+    install_completion
+    ;;
+
+  remove-completion)
+    remove_completion
+    ;;
+
+  *)
+    echo "Usage: innoclaude {ensure|update|check-update|version|install-completion|remove-completion}" >&2
+    exit 1
+    ;;
+esac
