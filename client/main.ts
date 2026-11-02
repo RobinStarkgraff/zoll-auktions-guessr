@@ -2,7 +2,7 @@ import { io, type Socket } from 'socket.io-client';
 import type { ClientToServer, PlayerView, RoomState, ServerToClient } from '../shared/types.ts';
 
 const app = document.getElementById('app')!;
-const euro = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
+const euro = new Intl.NumberFormat('en-IE', { style: 'currency', currency: 'EUR' });
 const fmt = (cents: number) => euro.format(cents / 100);
 
 // Per-tab identity so a reload rejoins the same seat.
@@ -61,11 +61,11 @@ function render() {
   const header = `
     <div class="topbar">
       <h1>Guess the Price</h1>
-      <span class="muted">Raum <span class="code">${s.code}</span>${s.round ? ` · Runde ${s.round}/${s.totalRounds}` : ''}</span>
+      <span class="muted">Room <span class="code">${s.code}</span>${s.round ? ` · Round ${s.round}/${s.totalRounds}` : ''}</span>
     </div>`;
   const body = {
     lobby: () => renderLobby(s, isHost),
-    loading: () => `<div class="card"><p>Lade Auktionen…</p></div>`,
+    loading: () => `<div class="card"><p>Loading auctions…</p></div>`,
     guessing: () => renderGuessing(s),
     reveal: () => renderReveal(s, isHost),
     finished: () => renderFinished(s, isHost),
@@ -88,29 +88,29 @@ function renderHome() {
   const code = params.get('room') ?? '';
   app.innerHTML = `
     <div class="topbar"><h1>Guess the Price</h1></div>
-    <p class="muted lead">Errate den aktuellen Gebotspreis echter Zoll-Auktionen. 5 Runden, wer am nächsten liegt, bekommt die meisten Punkte.</p>
+    <p class="muted lead">Guess the current bid on real German customs auctions. 5 rounds, the closest guess gets the most points.</p>
     <div class="cols-3">
       <div class="card">
-        <h2>Dein Name</h2>
+        <h2>Your name</h2>
         <div class="row"><input id="name" maxlength="20" value="${esc(storage.get('name') ?? '')}" autocomplete="nickname"></div>
       </div>
       <div class="card">
-        <h2>Raum beitreten</h2>
+        <h2>Join a room</h2>
         <div class="row">
           <input id="code" maxlength="4" placeholder="CODE" value="${esc(code)}" style="text-transform:uppercase">
-          <button id="join">Beitreten</button>
+          <button id="join">Join</button>
         </div>
       </div>
       <div class="card">
-        <h2>Neues Spiel</h2>
-        <button id="create">Raum erstellen</button>
+        <h2>New game</h2>
+        <button id="create">Create room</button>
       </div>
     </div>
     ${homeError ? `<p class="error">${esc(homeError)}</p>` : ''}`;
   const name = () => {
     const n = (document.getElementById('name') as HTMLInputElement).value.trim();
     if (!n) {
-      homeError = 'Bitte gib einen Namen ein.';
+      homeError = 'Please enter a name.';
       renderHome();
       return null;
     }
@@ -131,7 +131,7 @@ function renderHome() {
 
 function playerList(players: PlayerView[], s: RoomState, extra: (p: PlayerView) => string = () => '') {
   return `<ul class="players">${players
-    .map((p) => `<li><span>${esc(p.name)}${p.id === s.hostId ? ' <span class="tag">Host</span>' : ''}${p.id === playerId ? ' <span class="tag">(du)</span>' : ''}${p.connected ? '' : ' <span class="tag">offline</span>'}</span><span>${extra(p)}</span></li>`)
+    .map((p) => `<li><span>${esc(p.name)}${p.id === s.hostId ? ' <span class="tag">Host</span>' : ''}${p.id === playerId ? ' <span class="tag">(you)</span>' : ''}${p.connected ? '' : ' <span class="tag">offline</span>'}</span><span>${extra(p)}</span></li>`)
     .join('')}</ul>`;
 }
 
@@ -140,14 +140,14 @@ function renderLobby(s: RoomState, isHost: boolean) {
   return `
     <div class="cols-2">
       <div class="card">
-        <h2>Spieler (${s.players.length})</h2>
+        <h2>Players (${s.players.length})</h2>
         ${playerList(s.players, s)}
       </div>
       <div class="card">
-        <h2>Einladen</h2>
-        <p class="muted">Teile den Code <b class="code">${s.code}</b> oder den Link:<br><a href="${link}">${link}</a></p>
+        <h2>Invite</h2>
+        <p class="muted">Share the code <b class="code">${s.code}</b> or the link:<br><a href="${link}">${link}</a></p>
         ${s.error ? `<p class="error">${esc(s.error)}</p>` : ''}
-        ${isHost ? `<button id="start">Spiel starten</button>` : `<p class="muted">Warte auf den Host…</p>`}
+        ${isHost ? `<button id="start">Start game</button>` : `<p class="muted">Waiting for the host…</p>`}
       </div>
     </div>`;
 }
@@ -161,12 +161,12 @@ function renderGallery(item: NonNullable<RoomState['item']>) {
     <div class="gallery">
       <div class="gallery-main">
         <img class="item-img" id="gallery-img" src="${esc(imageSrc(current.src))}" alt="">
-        <button class="gallery-nav prev" id="gallery-prev" aria-label="Vorheriges Bild">‹</button>
-        <button class="gallery-nav next" id="gallery-next" aria-label="Nächstes Bild">›</button>
+        <button class="gallery-nav prev" id="gallery-prev" aria-label="Previous picture">‹</button>
+        <button class="gallery-nav next" id="gallery-next" aria-label="Next picture">›</button>
         <span class="gallery-count" id="gallery-count">${gallery.index + 1} / ${images.length}</span>
       </div>
       <div class="thumbs" id="gallery-thumbs">${images
-        .map((img, i) => `<button class="thumb${i === gallery.index ? ' active' : ''}" data-index="${i}" aria-label="Bild ${i + 1}"><img src="${esc(imageSrc(img.thumb))}" alt="" loading="lazy"></button>`)
+        .map((img, i) => `<button class="thumb${i === gallery.index ? ' active' : ''}" data-index="${i}" aria-label="Picture ${i + 1}"><img src="${esc(imageSrc(img.thumb))}" alt="" loading="lazy"></button>`)
         .join('')}</div>
     </div>`;
 }
@@ -207,10 +207,10 @@ function renderGuessing(s: RoomState) {
       <div class="card stage-media">${renderGallery(item)}</div>
       <aside class="stage-side">
         <div class="card">
-          <div class="topbar"><h2>Dein Tipp</h2><span class="timer" id="timer"></span></div>
+          <div class="topbar"><h2>Your guess</h2><span class="timer" id="timer"></span></div>
           ${me?.hasGuessed
-            ? `<p>Tipp abgegeben. Warte auf die anderen…</p>`
-            : `<form id="guess" class="row"><input id="amount" placeholder="z. B. 149,99" autofocus><span>€</span><button>Tippen</button></form>`}
+            ? `<p>Guess submitted. Waiting for the others…</p>`
+            : `<form id="guess" class="row"><input id="amount" placeholder="e.g. 149.99" autofocus><span>€</span><button>Guess</button></form>`}
           <div class="side-players">${playerList(s.players, s, (p) => (p.hasGuessed ? '✓' : '…'))}</div>
         </div>
         <div class="card item-info">
@@ -229,16 +229,16 @@ function renderReveal(s: RoomState, isHost: boolean) {
       <div class="card stage-media">${renderGallery(s.item!)}</div>
       <aside class="stage-side">
         <div class="card">
-          <p class="muted">${esc(s.item!.title)} · <a href="${esc(s.item!.url)}" target="_blank" rel="noopener">Zur Auktion</a></p>
-          <p>Aktuelles Gebot: <span class="price">${fmt(priceCents)}</span></p>
+          <p class="muted">${esc(s.item!.title)} · <a href="${esc(s.item!.url)}" target="_blank" rel="noopener">View auction</a></p>
+          <p>Current bid: <span class="price">${fmt(priceCents)}</span></p>
           <table>
-            <thead><tr><th>#</th><th>Spieler</th><th class="num">Tipp</th><th class="num">Daneben</th><th class="num">Punkte</th></tr></thead>
+            <thead><tr><th>#</th><th>Player</th><th class="num">Guess</th><th class="num">Off by</th><th class="num">Points</th></tr></thead>
             <tbody>${results
-              .map((r) => `<tr><td>${r.rank ?? '–'}</td><td>${esc(r.name)}</td><td class="num">${r.guessCents === null ? 'kein Tipp' : fmt(r.guessCents)}</td><td class="num">${fmt(r.offCents)}</td><td class="num">+${r.points}</td></tr>`)
+              .map((r) => `<tr><td>${r.rank ?? '–'}</td><td>${esc(r.name)}</td><td class="num">${r.guessCents === null ? 'no guess' : fmt(r.guessCents)}</td><td class="num">${fmt(r.offCents)}</td><td class="num">+${r.points}</td></tr>`)
               .join('')}</tbody>
           </table>
           <div class="actions">
-            ${isHost ? `<button id="next">${last ? 'Endergebnis' : 'Nächste Runde'}</button>` : `<p class="muted">Warte auf den Host…</p>`}
+            ${isHost ? `<button id="next">${last ? 'Final results' : 'Next round'}</button>` : `<p class="muted">Waiting for the host…</p>`}
           </div>
         </div>
         ${scoreboard(s)}
@@ -249,9 +249,9 @@ function renderReveal(s: RoomState, isHost: boolean) {
 function scoreboard(s: RoomState, list = [...s.players].sort((a, b) => b.score - a.score || a.totalOffCents - b.totalOffCents)) {
   return `
     <div class="card">
-      <h2>Punktestand</h2>
+      <h2>Scores</h2>
       <table>
-        <thead><tr><th>#</th><th>Spieler</th><th class="num">Punkte</th><th class="num">Insgesamt daneben</th></tr></thead>
+        <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num">Total off by</th></tr></thead>
         <tbody>${list
           .map((p, i) => `<tr${i === 0 && s.phase === 'finished' ? ' class="winner"' : ''}><td>${i + 1}</td><td>${esc(p.name)}</td><td class="num">${p.score}</td><td class="num">${fmt(p.totalOffCents)}</td></tr>`)
           .join('')}</tbody>
@@ -265,19 +265,24 @@ function renderFinished(s: RoomState, isHost: boolean) {
     <div class="cols-2 finish">
       <div class="card winner-card">
         <div class="trophy">🏆</div>
-        <h2>${esc(winner.name)} gewinnt!</h2>
-        <p class="muted">${winner.score} Punkte · insgesamt ${fmt(winner.totalOffCents)} daneben</p>
-        <p class="muted small">Bei Punktgleichheit entscheidet, wer insgesamt weniger danebenlag.</p>
-        ${isHost ? `<button id="start">Nochmal spielen</button>` : `<p class="muted">Warte auf den Host…</p>`}
+        <h2>${esc(winner.name)} wins!</h2>
+        <p class="muted">${winner.score} points · ${fmt(winner.totalOffCents)} off in total</p>
+        <p class="muted small">On a tie in points, the smaller total distance wins.</p>
+        ${isHost ? `<button id="start">Play again</button>` : `<p class="muted">Waiting for the host…</p>`}
       </div>
       ${scoreboard(s, s.standings!)}
     </div>`;
 }
 
-/** Accepts "1.234,56", "1234.56", "1234" and returns cents. */
+/**
+ * Accepts English ("1,234.56") and German ("1.234,56") notation and returns cents.
+ * The last separator is the decimal point if one or two digits follow it; all others group thousands.
+ */
 function parseGuess(input: string): number | null {
   let v = input.replace(/[€\s]/g, '');
-  if (v.includes(',')) v = v.replace(/\./g, '').replace(',', '.');
+  if (!/\d/.test(v)) return null;
+  const decimal = /[.,](\d{1,2})$/.exec(v);
+  v = decimal ? `${v.slice(0, decimal.index).replace(/[.,]/g, '')}.${decimal[1]}` : v.replace(/[.,]/g, '');
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) : null;
 }
