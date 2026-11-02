@@ -24,7 +24,7 @@ git push -u origin master
 3. Connect the repository (grant Render access to it if it isn't listed) and pick the branch you pushed.
 4. Render reads `render.yaml` and shows one web service, `guess-the-price`. Click **Apply**.
 5. Wait for the first build (a few minutes). The log should end with
-   `Guess the price running on http://localhost:10000 (items: zoll)`.
+   `Guess the price running on http://localhost:10000 (items: zoll, translate: en)`.
 
 The game is now live at `https://guess-the-price-xxxx.onrender.com` (the exact URL is shown on the service page).
 
@@ -45,6 +45,9 @@ A redeploy restarts the server, so don't push during a game.
 - **Live items may get blocked.** Zoll-Auktion might rate-limit or block cloud IP addresses.
   If rounds show no items, go to the service → **Environment**, set `ITEM_SOURCE` to `mock`, and save
   (Render restarts with the built-in sample items).
+- **Translation may stop working.** Auction texts are translated through Google's unofficial, keyless
+  Translate endpoint, which can rate-limit or block cloud IPs without notice. Items then show in German;
+  the game keeps working. Set `TRANSLATE_TO` to `off` to skip translation entirely.
 - **Node version.** The project needs Node ≥ 22.12 (Vitest 5 requires it). Render uses Node 22 via `NODE_VERSION`.
 
 ### Troubleshooting

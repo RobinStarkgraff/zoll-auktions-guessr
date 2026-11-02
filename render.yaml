@@ -19,3 +19,7 @@ services:
       # zoll = live Zoll-Auktion items, mock = built-in sample items
       - key: ITEM_SOURCE
         value: zoll
+      # Language code to translate auction texts into via the unofficial Google Translate
+      # endpoint, or "off". Falls back to the German original if translation fails.
+      - key: TRANSLATE_TO
+        value: en

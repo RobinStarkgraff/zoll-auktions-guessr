@@ -1,5 +1,6 @@
 import type { Item } from '../../../shared/types.ts';
 import { mockProvider } from './mock.ts';
+import { withTranslation } from './translate.ts';
 import { zollProvider } from './zoll.ts';
 
 export interface ItemProvider {
@@ -7,10 +8,14 @@ export interface ItemProvider {
   fetchItems(count: number): Promise<Item[]>;
 }
 
-export function createProvider(source = process.env.ITEM_SOURCE ?? 'zoll'): ItemProvider {
-  if (source === 'mock') return mockProvider;
-  if (source === 'zoll') return zollProvider;
-  throw new Error(`Unknown ITEM_SOURCE "${source}" (expected "zoll" or "mock")`);
+export function createProvider(
+  source = process.env.ITEM_SOURCE ?? 'zoll',
+  translateTo = process.env.TRANSLATE_TO ?? 'en',
+): ItemProvider {
+  const providers: Record<string, ItemProvider> = { mock: mockProvider, zoll: zollProvider };
+  const provider = providers[source];
+  if (!provider) throw new Error(`Unknown ITEM_SOURCE "${source}" (expected "zoll" or "mock")`);
+  return translateTo && translateTo !== 'off' ? withTranslation(provider, translateTo) : provider;
 }
 
 export function shuffle<T>(list: T[]): T[] {

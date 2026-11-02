@@ -105,5 +105,5 @@ io.on('connection', (socket) => {
 });
 
 http.listen(PORT, () => {
-  console.log(`Guess the price running on http://localhost:${PORT} (items: ${process.env.ITEM_SOURCE ?? 'zoll'})`);
+  console.log(`Guess the price running on http://localhost:${PORT} (items: ${process.env.ITEM_SOURCE ?? 'zoll'}, translate: ${process.env.TRANSLATE_TO ?? 'en'})`);
 });
