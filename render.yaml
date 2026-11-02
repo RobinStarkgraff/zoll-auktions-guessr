@@ -1,0 +1,21 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# One web service: the Node server runs the game and serves the built client.
+services:
+  - type: web
+    name: guess-the-price
+    runtime: node
+    plan: free
+    # Rooms live in server memory, so this must stay a single instance.
+    numInstances: 1
+    # Don't set NODE_ENV here: it would skip devDependencies (vite) during the build.
+    # `npm start` sets NODE_ENV=production itself.
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # zoll = live Zoll-Auktion items, mock = built-in sample items
+      - key: ITEM_SOURCE
+        value: zoll

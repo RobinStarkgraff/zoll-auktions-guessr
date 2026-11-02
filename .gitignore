@@ -21,3 +21,7 @@
 .claude-notify-ports/
 # JetBrains IDE settings
 .idea/
+
+# Node
+node_modules/
+dist/
